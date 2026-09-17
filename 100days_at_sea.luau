@@ -1,6 +1,6 @@
 --[[
     Behavioral reconstruction of "Untitled_1 2(2).luau".
-    Release: v57 - fast bounded Sack batches with stable position and full acknowledgement
+    Release: v58 - faster confirmed Builder cycles and isolated native Wrench callbacks
 
     The original program was flattened and its constants were encoded. This
     version keeps the reconstructed features but uses a local, dependency-free
@@ -1631,7 +1631,7 @@ function SeaUI:CreateWindow(config)
         BackgroundColor3 = SEA_COLORS.Raised,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamBold,
-        Text = "v57",
+        Text = "v58",
         TextColor3 = SEA_COLORS.Muted,
         TextSize = 9,
     }, header)
@@ -11508,12 +11508,61 @@ local Builder: any = (function()
     local api = {}
     local removeEnabled, placeEnabled = false, false
     local running, generation = false, 0
-    local pending
+    local pending = {} -- one remove and one place response at most
     local placement
     local removeNotBefore, craftNotBefore, placeNotBefore = 0, 0, 0
     local message = "Ready. Enable a Builder action."
     local removedCount, placedCount = 0, 0
     local removeToggle, placeToggle
+    local wrenchScripts = {}
+
+    local function restoreWrenchScripts()
+        for client, saved in pairs(wrenchScripts) do
+            local ok = pcall(function()
+                if client.Parent then
+                    -- Restore in Backpack so the native script can start cleanly
+                    -- on the next manual equip, including after Stop / respawn.
+                    if saved.tool.Parent == getCharacter() then
+                        local humanoid = getHumanoid()
+                        if humanoid then humanoid:UnequipTools() end
+                    end
+                    client.Disabled = saved.disabled
+                end
+            end)
+            if ok then wrenchScripts[client] = nil end
+        end
+    end
+
+    local function prepareWrench(tool, canRun)
+        local client = tool:FindFirstChild("WrenchClient")
+        if not client or not client:IsA("LocalScript") then return true end
+        if wrenchScripts[client] then return client.Disabled == true end
+        -- WrenchClient's Heartbeat highlight calls tool.Parent:GetPivot() even
+        -- during a tool switch, when Parent is Backpack. Builder already supplies
+        -- the exact teardown target; its native aiming UI is not needed here.
+        if tool.Parent == getCharacter() then
+            getHumanoid():UnequipTools()
+            RunService.Heartbeat:Wait() -- let native Unequipped clean its UI first
+        end
+        if not canRun() then return false end
+        local ok = pcall(function()
+            local saved = { tool = tool, disabled = client.Disabled }
+            wrenchScripts[client] = saved
+            client.Disabled = true
+        end)
+        return ok and client.Disabled == true
+    end
+
+    local function nativeFunction(name)
+        -- Farm Pearl resolves the game's runtime globals before executor _G.
+        if type(getrenv) == "function" then
+            local ok, runtime = pcall(getrenv)
+            local candidate = ok and type(runtime) == "table"
+                and type(runtime._G) == "table" and runtime._G[name]
+            if type(candidate) == "function" then return candidate end
+        end
+        return type(_G) == "table" and _G[name] or nil
+    end
 
     local function craftedFolder()
         local island = workspace:FindFirstChild("SpawnIsland")
@@ -11579,15 +11628,30 @@ local Builder: any = (function()
         return nil
     end
 
-    local function request(kind, target, canRun)
-        if pending then return false, "Waiting for Builder response" end
+    local function observe(ticket)
+        if ticket.observed then return true end
+        local result = ticket.confirm()
+        if not result then return false end
+        ticket.observed = true
+        if ticket.kind == "remove" then
+            removedCount = removedCount + 1
+        else
+            placedCount = placedCount + 1
+            placement = result:GetPivot()
+        end
+        return true
+    end
+
+    local function request(kind, target, canRun, confirm)
+        if pending[kind] then return false, "Waiting for previous " .. kind .. " response" end
         if not canRun() then return false, "Cancelled" end
-        local native = if kind == "remove" then _G.ToolProcessor else _G.PlaceBuildable
+        local native = nativeFunction(kind == "remove" and "ToolProcessor" or "PlaceBuildable")
         local network = type(native) ~= "function" and getGameNetwork() or nil
         if type(native) ~= "function" and not network then return false, "Builder network is not ready" end
-        local ticket = { done = false, accepted = false }
-        pending = ticket
+        local ticket = { done = false, kind = kind, confirm = confirm }
+        pending[kind] = ticket
         task.spawn(function()
+            if not canRun() then ticket.rejected = true; ticket.done = true; return end
             local ok, result = pcall(function()
                 if kind == "remove" then
                     if type(native) == "function" then return native("Wrench", "Teardown", target) end
@@ -11596,43 +11660,61 @@ local Builder: any = (function()
                 if type(native) == "function" then return native("Outpost", target, nil) end
                 return network:InvokeServer("PlaceBuildable", "Outpost", target, nil)
             end)
-            ticket.accepted = ok and result ~= false
+            -- A thrown request may already have reached the server. Retain that
+            -- ticket until replication confirms it; only explicit false rejects.
+            ticket.rejected = ok and result == false
             ticket.done = true
         end)
         local deadline = os.clock() + 6
-        while not ticket.done do
+        repeat
             if not canRun() then return false, "Cancelled" end
-            if os.clock() >= deadline then return false, "Waiting for Builder response" end
+            if observe(ticket) then
+                if ticket.done then pending[kind] = nil end
+                return true, "Confirmed " .. kind
+            end
+            if ticket.done and ticket.rejected then
+                pending[kind] = nil
+                return false, "Server declined " .. kind
+            end
+            if SharedInteraction.Touch then SharedInteraction.Touch("builder") end
             RunService.Heartbeat:Wait()
-        end
-        if pending == ticket then pending = nil end
-        return ticket.accepted, ticket.accepted and "Waiting for replication" or "Server declined " .. kind
+        until os.clock() >= deadline
+        return false, "Waiting for " .. kind .. " replication / response"
     end
 
     local function step(canRun)
-        if pending then
-            if not pending.done then message = "Waiting for Builder response"; return end
-            pending = nil
-        end
         if localPlayer:GetAttribute("Class") ~= "Builderman" then
+            restoreWrenchScripts()
             message = "Requires Builderman class"
             return
         end
         local root, humanoid = getHumanoidRootPart(), getHumanoid()
         if not root or not humanoid or humanoid.Health <= 0 or humanoid.SeatPart then
+            restoreWrenchScripts()
             message = "Waiting for a living, unseated character"
             return
         end
-        if not craftedFolder() then message = "Waiting for SpawnIsland.Crafted"; return end
+        if not craftedFolder() then restoreWrenchScripts(); message = "Waiting for SpawnIsland.Crafted"; return end
         -- Let existing Sack/route workers own their tools; resume when they stop.
         if Config:Get("AutoLootWorld") == true or Config:Get("AutoBonfire") == true
             or Config:Get("AutoGrinder") == true or Config:Get("AutoChestAndLoot") == true
             or Config:Get("FlyEnabled") == true or (Travel and Travel.Busy)
-        then message = "Paused while travel / Sack automation is active"; return end
+        then restoreWrenchScripts(); message = "Paused while travel / Sack automation is active"; return end
+
+        for kind, ticket in pairs(pending) do
+            local confirmed = observe(ticket)
+            if ticket.done and (confirmed or ticket.rejected) then
+                pending[kind] = nil
+            elseif not confirmed then
+                message = "Waiting for " .. kind .. " replication / response"
+                return
+            end
+        end
 
         local existing, distance = nearestOutpost()
         if existing then
             if not removeEnabled then message = "Outpost is already placed"; return end
+            if pending.remove then message = "Waiting for previous remove response"; return end
             if distance > Config:Get("BuilderRemoveRadius") then
                 message = "Move within " .. tostring(Config:Get("BuilderRemoveRadius")) .. " studs of the Outpost"
                 return
@@ -11641,6 +11723,7 @@ local Builder: any = (function()
             if os.clock() < removeNotBefore then return end
             local wrench = findTool("Wrench")
             if not wrench then message = "Wrench is required in your Backpack"; return end
+            if not prepareWrench(wrench, canRun) then message = "Waiting for Wrench callback cleanup"; return end
             if not equip(wrench, canRun) then message = "Waiting to equip Wrench"; return end
             if not canRun() or existing.Parent ~= craftedFolder() or existing:GetAttribute("Active") == true then return end
             placement = existing:GetPivot()
@@ -11648,25 +11731,19 @@ local Builder: any = (function()
             -- Confirm this model disappeared; successful new cycles need no fixed pause.
             removeNotBefore = os.clock() + 0.08
             message = "Removing Outpost with Wrench..."
-            local accepted, reason = request("remove", existing.Name, canRun)
+            local folder = craftedFolder()
+            local accepted, reason = request("remove", existing.Name, canRun, function()
+                return existing.Parent ~= folder
+            end)
             if not canRun() then return end
             if not accepted then message = reason; removeNotBefore = os.clock() + 0.20; return end
-            local deadline = os.clock() + 2
-            while canRun() and existing.Parent == craftedFolder() and os.clock() < deadline do
-                RunService.Heartbeat:Wait()
-            end
-            if not canRun() then return end
-            if existing.Parent ~= craftedFolder() then
-                removedCount = removedCount + 1
-                removeNotBefore = 0
-                message = "Outpost removed; position remembered"
-            else
-                message = "Removal not confirmed; waiting before retry"
-            end
-            return
+            removeNotBefore = 0
+            message = "Outpost removed; position remembered"
+            return true
         end
 
         if not placeEnabled then message = "Waiting for an Outpost in Wrench range"; return end
+        if pending.place then message = "Waiting for previous place response"; return end
         local tool = findTool("Outpost")
         if not tool then
             if os.clock() < craftNotBefore then return end
@@ -11700,26 +11777,21 @@ local Builder: any = (function()
         if os.clock() < placeNotBefore then return end
         if not canRun() or nearestOutpost() then return end
         message = "Placing Outpost..."
-        local accepted, reason = request("place", target, canRun)
+        local folder = craftedFolder()
+        local accepted, reason = request("place", target, canRun, function()
+            if craftedFolder() ~= folder then return nil end
+            for _, model in ipairs(folder:GetChildren()) do
+                if isOutpost(model) and (model:GetPivot().Position - target.Position).Magnitude <= 8 then
+                    return model
+                end
+            end
+            return nil
+        end)
         if not canRun() then return end
         if not accepted then message = reason; placeNotBefore = os.clock() + 0.5; return end
-        local deadline = os.clock() + 2
-        local placed
-        repeat
-            placed = nearestOutpost()
-            if placed then break end
-            RunService.Heartbeat:Wait()
-        until not canRun() or os.clock() >= deadline
-        if not canRun() then return end
-        if placed then
-            placedCount = placedCount + 1
-            placement = placed:GetPivot()
-            message = "Outpost placed"
-            placeNotBefore = 0
-        else
-            message = "Placement not confirmed; waiting for server / tool replication"
-            placeNotBefore = os.clock() + 1
-        end
+        message = "Outpost placed"
+        placeNotBefore = 0
+        return true
     end
 
     local function startWorker()
@@ -11735,14 +11807,21 @@ local Builder: any = (function()
                         and character ~= nil and humanoid ~= nil and humanoid.Health > 0
                 end
                 if SharedInteraction.TryAcquire("builder") then
-                    local ok, reason = pcall(step, canRun)
+                    local ok, reason = pcall(function()
+                        -- Chain confirmed remove -> craft/place immediately. Bound
+                        -- the chain to two stages so other workers still get time.
+                        for _ = 1, 2 do
+                            if not canRun() or not step(canRun) then break end
+                        end
+                    end)
                     SharedInteraction.Release("builder")
-                    if not ok then message = "Builder error: " .. tostring(reason) end
+                    if not ok then restoreWrenchScripts(); message = "Builder error: " .. tostring(reason) end
                 else
                     message = "Waiting for current interaction"
                 end
                 RunService.Heartbeat:Wait()
             end
+            restoreWrenchScripts()
             running = false
         end)
     end
@@ -11751,6 +11830,7 @@ local Builder: any = (function()
         removeEnabled = enabled == true
         generation = generation + 1
         if removeEnabled then startWorker() end
+        if not removeEnabled then restoreWrenchScripts() end
     end
 
     function api.SetPlace(enabled)
@@ -15410,7 +15490,7 @@ end)()
 -- Interface construction ---------------------------------------------------
 
 local window: any = SeaUI:CreateWindow({
-    Title = "100 Days at Sea v57",
+    Title = "100 Days at Sea v58",
     ToggleKey = Enum.KeyCode.RightShift,
 })
 window:SetToggleKey(Enum.KeyCode.RightShift)
@@ -16180,7 +16260,7 @@ assert(pcall(function()
     saveSection:Paragraph({
         Title = "Save Status",
         Desc = Config:StorageLabel()
-            .. ". v57 keeps the existing v28 save slot, including named teleport coordinates.",
+            .. ". v58 keeps the existing v28 save slot, including named teleport coordinates.",
     })
 
     local controlsSection = settingsTab:Section({ Title = "Controls & Session" })
@@ -16399,4 +16479,4 @@ if globalEnvironment then
     globalEnvironment[SCRIPT_CLEANUP_KEY] = unloadScript
 end
 
-print("100 Days at Sea v57 loaded successfully!")
+print("100 Days at Sea v58 loaded successfully!")
