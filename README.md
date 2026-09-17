@@ -10,6 +10,14 @@ Use this dedicated loader. It supplies the downloaded source to the farm's built
 loadstring(game:HttpGet("https://raw.githubusercontent.com/jejow/main-luau/refs/heads/main/farm_pearl_loader.luau"))()
 ```
 
+## Farm Pearl Native
+
+Original `Untitled_1.luau` (BAAN HUB v19), published as `farm pearl native.luau`. Uses direct fuel dragging, chest farming and Merchant purchases; no Volcano stage.
+
+```luau
+loadstring(game:HttpGet("https://raw.githubusercontent.com/jejow/main-luau/refs/heads/main/farm%20pearl%20native.luau"))()
+```
+
 ## 100 Days at Sea
 
 Current: v58. Builder advances after observed Outpost changes, tracks pending remove/place responses, and temporarily suspends the native Wrench aiming script during auto-remove. Stop restores its original state.
